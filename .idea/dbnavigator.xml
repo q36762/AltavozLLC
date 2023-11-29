@@ -1,0 +1,865 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="DBNavigator.Project.DataEditorManager">
+    <record-view-column-sorting-type value="BY_INDEX" />
+    <value-preview-text-wrapping value="true" />
+    <value-preview-pinned value="false" />
+  </component>
+  <component name="DBNavigator.Project.DatabaseBrowserManager">
+    <autoscroll-to-editor value="false" />
+    <autoscroll-from-editor value="true" />
+    <show-object-properties value="true" />
+    <loaded-nodes />
+  </component>
+  <component name="DBNavigator.Project.DatabaseConsoleManager">
+    <connection id="1a7a4e3c-6c8c-41f6-b609-682767f96d73">
+      <console name="luna - c5241007 missed visit report" type="STANDARD" schema="public" session="Main"><![CDATA[--------------------------------------------------study_7eee7085-af91-4e09-9965-6be923400240---------------------------------------
+
+WITH flattened_widget_info AS
+/* CTE to identify the visit name for all the subjects on the response for visit selection diary. Data is captured from version_data and versions table with the necessary active response and study filters.
+ * Data has filtered by widgetName and minifest name. WidgetName like VISITNUM  so that we can see all the diaries
+ */
+(
+SELECT distinct subjects.guid AS subject_guid,     
+		--formWidgets->1->>'widgetName' as "widget_name",
+        manifest_item as "diary_guid",
+	    manifest_data -> 'contextDef' ->> 'contextDefName' as "diary_name",
+		selectors->>'key' as visit_key_actual,			
+		INITCAP(replace(selectors->>'key','_', ' '))  visit_key,
+        case when formWidgets->1->>'widgetName' like 'visit%' then
+        INITCAP(replace(selectors->>'key','day_', ' '))::int end key_number,
+		subjects.disabled as subject_status		
+	FROM version_data
+        JOIN versions ON version_data.version_guid = versions.guid
+        JOIN subjects ON subjects.study_guid = identifier
+        AND subjects.study_version_guid = version_data.version_guid
+        JOIN studies ON studies.guid = identifier,
+        jsonb_array_elements( manifest_data->'contextDef'->'forms') as forms,
+        jsonb_array_elements( forms->1->'formWidgets') as formWidgets,
+        jsonb_array_elements(formWidgets->1->'widgetProperties'->'selectorItems') as selectors 
+    WHERE 
+        studies.guid = 'study_7eee7085-af91-4e09-9965-6be923400240'		
+        AND manifest_name = 'diaryReduction'        
+        AND formWidgets->1->>'widgetName' like 'visit%'
+        AND selectors->>'key' <> 'visit_selection'
+        and  studies.utc_time_deleted IS null
+),
+visit_info as (
+/* CTE has been written to generate visit number for all the visits. 
+We have filtered only visit selection diary so that we can see only visits details.
+*/
+SELECT  ROW_NUMBER() OVER (PARTITION BY subject_guid ORDER BY key_number::int) AS visit_number,    	 
+          visit_key,          
+          subject_guid		  		            
+    FROM flattened_widget_info		
+    where flattened_widget_info.diary_name like 'Visit%Activation%'    	
+    group by key_number,       
+          visit_key,         
+          subject_guid   
+),
+visit_diary_info as (
+/* CTE has been written to get only diary names for all the subjects 
+We have filtered not in 'Training',	'Visit Selection', 'Missed Visit' diaries, so that we can see only diaries
+Doing grouping by to taking out dublicate records
+*/
+select
+	visit_info.subject_guid,
+	visit_number,
+	visit_info.visit_key,
+	'EQ-5D-5L' as diary_name /* we are taking out proxy and RTL which is extra name in diaries. */
+from
+	visit_info
+join flattened_widget_info on
+	visit_info.subject_guid = flattened_widget_info.subject_guid   
+group by
+	visit_info.subject_guid,
+	visit_number,
+	visit_info.visit_key,
+	diary_name
+order by visit_number
+),
+visit_responses as (
+select  response_export_desc.subject_guid,
+        response_export_desc.diary_name,
+        --visit_number,	
+        --response_export_data.value_new,	
+        max(response_export_desc.server_user_guid) over (partition by response_export_desc.subject_guid) as server_user_guid,
+        initcap(replace(response_export_data.value_new, '_', ' '))  as visit_key,    
+        max(case when response_export_data.value_new = 'day_28' then 1 else 0 end) over (partition by response_export_desc.subject_guid) eot_triggered,
+        max(case when response_export_data.value_new = 'day_28' then (to_timestamp(trunc(cast(response_export_desc.completion_utc as bigint) / 1000))at time zone completion_subject_tz)::date end) over (partition by response_export_desc.subject_guid) eot_date,
+        max(case when response_export_data.value_new like 'day_%' then response_export_data.value_new end ) over (partition by response_export_desc.subject_guid) last_cycle_visit,
+        max(case when visit_number <= 6 then visit_number end) over (partition by response_export_desc.subject_guid) last_cycle_visit_number,
+        max(response_export_data.value_new) over (partition by response_export_desc.subject_guid) last_visit,
+        max(visit_number) over (partition by response_export_desc.subject_guid) last_visit_number,
+        --max(replace(response_export_data.value_new, 'day_', '')::int ) over (partition by response_export_desc.subject_guid) last_visit_number,
+        (to_timestamp(trunc(cast(response_export_desc.completion_utc as bigint) / 1000))at time zone completion_subject_tz)::date  as response_completion_date,
+        (to_timestamp(trunc(cast(response_export_desc.completion_utc as bigint) / 1000))at time zone completion_subject_tz)::timestamp as response_completed_timezone,
+		ROW_NUMBER() over (partition by response_export_desc.subject_guid, (to_timestamp(trunc(cast(response_export_desc.completion_utc as bigint) / 1000))at time zone completion_subject_tz)::DATE
+			order by (to_timestamp(trunc(cast(response_export_desc.completion_utc as bigint) / 1000))at time zone completion_subject_tz)::timestamp desc  ) as visit_rank, 
+		ROW_NUMBER() over (partition by response_export_desc.subject_guid, visit_number order by response_export_desc.completion_utc desc  ) as visit_rank_visit
+      from
+	response_export_desc
+left join response_export_data on response_export_desc.rec_uuid = response_export_data.rec_uuid
+left join visit_info on response_export_desc.subject_guid = visit_info.subject_guid
+	and visit_info.visit_key = initcap(replace(response_export_data.value_new, '_', ' '))	
+where
+	study_guid = 'study_7eee7085-af91-4e09-9965-6be923400240'
+    and response_export_desc.active IS TRUE
+	AND response_export_desc.deleted IS FALSE	 
+    and response_export_data.widget_data_key like 'visit%'
+),
+visit_response_consolidated as(
+select
+	visit_info.subject_guid,
+	server_user_guid,
+	visit_info.visit_key as planned_visit_key,
+	visit_responses.visit_key as actual_visit_key,
+	visit_number,	
+	max(eot_triggered) over (partition by visit_info.subject_guid) as eot_triggered,
+	max(last_cycle_visit) over (partition by visit_info.subject_guid) as last_cycle_visit,
+	last_cycle_visit_number,
+	max(last_visit) over (partition by visit_info.subject_guid) as last_visit,
+	last_visit_number,
+	response_completion_date,
+	response_completed_timezone,
+	eot_date,
+	case
+		when max(eot_triggered) over (partition by visit_info.subject_guid) = 1 then
+		case
+			when visit_number <= max(last_cycle_visit_number) over (partition by visit_info.subject_guid) then
+			case
+				when response_completion_date is not null  then 'Completed Visit' ----and visit_response_dairy_name<>'Missed Visit' has been removed here
+				else 'Missed Visit' end
+				when visit_number=6 then
+				case
+					when response_completion_date is not null then 'Completed Visit' -------and visit_response_dairy_name<>'Missed Visit'					                    					
+                    else 'Expected Visit' end
+					else 'EOT Triggered' end
+					else
+					case
+						when visit_number <= max(last_cycle_visit_number) over (partition by visit_info.subject_guid) then
+						case
+							when response_completion_date is not null then 'Completed Visit'  ------and visit_response_dairy_name<>'Missed Visit'
+							else 'Missed Visit' end
+							else 'Expected Visit' end end as visit_status
+						from
+							visit_info
+						left join visit_responses on
+							visit_info.subject_guid = visit_responses.subject_guid
+							and visit_info.visit_key = visit_responses.visit_key
+						and visit_rank=1 and visit_rank_visit=1
+                        order by visit_number
+	),
+diary_responses as (
+	SELECT response_export_desc.subject_guid,
+          subjects.study_guid,          
+		  response_export_desc.diary_name AS diary_name,
+		  case when diary_name like '%Proxy Entry%' then 'Proxy Entry' else 'ePRO' end as diary_type,
+          date_trunc('day', TO_TIMESTAMP(TRUNC(CAST(response_export_desc.completion_utc AS BIGINT) / 1000)) at time zone completion_subject_tz) AS response_completion_date ,
+		  MAX(TO_TIMESTAMP(CAST(response_export_desc.start_utc AS BIGINT) / 1000) at time zone completion_subject_tz) AS diary_start_datetime ,
+		  MAX(TO_TIMESTAMP(CAST(response_export_desc.start_utc AS BIGINT) / 1000) at time zone completion_subject_tz)::TIME as start_time,
+		  max(TO_TIMESTAMP(CAST(response_export_desc.completion_utc AS BIGINT) / 1000) at time zone completion_subject_tz) AS diary_completion_datetime ,
+		  max(TO_TIMESTAMP(CAST(response_export_desc.completion_utc AS BIGINT) / 1000) at time zone completion_subject_tz)::TIME AS completion_time ,
+		  sum(case when diary_name like '%Proxy Entry%' then 1 else null end) over (PARTITION by subject_guid)   as proxyentry_response_diary_count,
+		  sum(case when diary_name not like '%Proxy Entry%' then 1 else null end) over (PARTITION by subject_guid) as epro_response_diary_count
+    FROM response_export_desc
+      LEFT JOIN response_export_data ON response_export_desc.rec_uuid = response_export_data.rec_uuid
+      LEFT JOIN subjects ON subjects.guid = response_export_desc.subject_guid
+      LEFT JOIN studies ON studies.guid = subjects.study_guid
+    WHERE response_export_desc.active IS TRUE
+	AND response_export_desc.deleted IS FALSE
+    AND   response_export_desc.diary_name NOT LIKE ('Visit%Activation')
+    AND   studies.guid = 'study_7eee7085-af91-4e09-9965-6be923400240'
+	--AND response_export_desc.subject_guid='study_95a854a3-617f-4d34-8b11-05a317e60d0c'
+    GROUP BY response_export_desc.subject_guid,
+            subjects.study_guid,
+            response_export_desc.diary_name,						
+            date_trunc('day', TO_TIMESTAMP(TRUNC(CAST(response_export_desc.completion_utc AS BIGINT) / 1000)) at time zone completion_subject_tz)
+),
+visit_response_status as (
+select
+	visit_response_consolidated.subject_guid, 
+	server_user_guid,   
+	planned_visit_key,
+	actual_visit_key,
+	diary_name as planned_diaries,
+	visit_response_consolidated.visit_number,
+	eot_triggered,
+	last_cycle_visit,
+	last_cycle_visit_number,
+	last_visit,
+	last_visit_number,
+	response_completion_date,
+	response_completed_timezone,
+	eot_date,
+	visit_status
+from
+	visit_response_consolidated
+left join visit_diary_info on
+	visit_diary_info.subject_guid = visit_response_consolidated.subject_guid
+	and visit_diary_info.visit_key = visit_response_consolidated.planned_visit_key
+),
+schedule_rules AS
+  (
+    SELECT subjects.guid AS subject_guid,
+          subjects.study_guid,
+          manifest_data
+    FROM version_data
+      JOIN versions ON version_data.version_guid = versions.guid
+      JOIN subjects
+        ON subjects.study_guid = identifier
+      AND subjects.study_version_guid = version_data.version_guid
+      JOIN studies ON studies.guid = identifier
+    WHERE studies.guid = 'study_7eee7085-af91-4e09-9965-6be923400240'
+    AND   manifest_name = 'ruleSets'
+  ),
+diary_names AS
+  (
+  SELECT subjects.guid AS subject_guid,
+          subjects.study_guid,
+          manifest_item AS diary_def_guid,
+          case when manifest_data -> 'contextDef' ->> 'contextDefName' like '%Proxy%Entry%' THEN 'Proxy Entry' else 'ePRO' end as diary_type,
+		  REPLACE(REPLACE(manifest_data -> 'contextDef' ->> 'contextDefName',' Proxy Entry',''),'RTL','')  AS diary_name          
+    FROM version_data
+      JOIN versions ON version_data.version_guid = versions.guid
+      JOIN subjects
+        ON subjects.study_guid = identifier
+      AND subjects.study_version_guid = version_data.version_guid
+      JOIN studies ON studies.guid = identifier
+    WHERE studies.guid = 'study_7eee7085-af91-4e09-9965-6be923400240'
+    AND   manifest_name = 'diaryReduction' 
+  ),
+  schedule_mapping AS
+  (
+    SELECT subject_guid,
+          study_guid,
+          schedulerules ->> 'contextDefGuid' AS diary_def_guid,
+          schedulerules ->> 'ruleKey' AS diary_key,
+          --schedulecalculation-> 'calculation'->>'ruleKey' as anotherrulekey,
+          count(schedulerules ->> 'ruleKey') over (partition by subject_guid, INITCAP(REPLACE(REPLACE(schedulecalculation -> 'calculation' ->> 'dataKey','v',''),'day', 'Day ')) ) as visit_diary_count,
+          --CASE WHEN schedulecalculation-> 'calculation'->>'dataKey' like '%v%' then concat('Begin Visit ', REGEXP_REPLACE(schedulecalculation-> 'calculation'->>'ruleKey', '\D', '', 'g')) else
+          INITCAP(REPLACE(REPLACE(schedulecalculation -> 'calculation' ->> 'dataKey','v',''),'day', 'Day ')) AS visit_key
+    FROM schedule_rules,
+        JSONB_ARRAY_ELEMENTS(manifest_data -> 'ruleSet' -> 'rules') schedulerules,
+        JSONB_ARRAY_ELEMENTS(schedulerules -> 'triggers') schedulecalculation           
+	),
+schedule_visit_diary_info as (
+	SELECT schedule_mapping.subject_guid,
+          schedule_mapping.study_guid,
+          visit_key,
+         --diary_type,
+		 visit_diary_count,
+          CASE
+            WHEN diary_names.diary_def_guid IS NULL THEN schedule_mapping.diary_def_guid
+            ELSE diary_name
+          END AS diary_name
+    FROM schedule_mapping
+      LEFT JOIN diary_names
+            ON schedule_mapping.diary_def_guid = diary_names.diary_def_guid
+            AND schedule_mapping.subject_guid = diary_names.subject_guid
+    WHERE visit_key is not null
+)select
+	visit_response_status.subject_guid,
+	visit_response_status.server_user_guid,
+	subjects.ident,
+	studies.guid as "Study GUID",
+	studies."name",
+	sites.name as "Site Name",
+	sites.guid as "Site GUID",
+	orgs.guid as "Org GUID",
+	orgs."name" as "Org Name",
+	visit_response_status.visit_number,
+	actual_visit_key,
+	replace(planned_visit_key, 'Begin ','') as planned_visit_key,	
+	planned_diaries,
+	diary_responses.diary_name as completed_diaries,
+	visit_response_status.response_completion_date,
+	diary_responses.response_completion_date as diary_response_date,
+	diary_completion_datetime,
+	diary_start_datetime,
+	start_time::text,
+	completion_time::text, 	
+	response_completed_timezone,
+	eot_date,
+	eot_triggered,
+	last_cycle_visit,
+	last_cycle_visit_number,
+	last_visit,
+	diary_type,
+	proxyentry_response_diary_count,
+	epro_response_diary_count,
+	subjects.disabled,
+	ROW_NUMBER() over (partition by visit_response_status.subject_guid order by epro_response_diary_count desc nulls last) as epro_response_diary_rank,
+	ROW_NUMBER() over (partition by visit_response_status.subject_guid order by proxyentry_response_diary_count desc nulls last) as proxyentry_response_diary_rank,
+	case
+	    when visit_status = 'Completed Visit'
+		and count(diary_responses.diary_name) over (partition by visit_response_status.subject_guid,
+		planned_visit_key) =0 then 'Missed'
+		when visit_status = 'Completed Visit' 
+		and count(diary_responses.diary_name) over (partition by visit_response_status.subject_guid,
+		planned_visit_key) < visit_diary_count then 'Partially Completed'
+        when visit_status = 'Completed Visit' 
+		and count(diary_responses.diary_name) over (partition by visit_response_status.subject_guid,
+		planned_visit_key) = visit_diary_count then 'Completed'
+		--when visit_status='Expected Visit' then 'Expected'
+		else replace(visit_status,' Visit','') end as visit_status,
+
+		case when visit_status = 'TDV Triggered' then 0
+		when subjects.disabled is false and visit_status = 'Expected Visit' then 1
+		when subjects.disabled is true and visit_status = 'Expected Visit' then 4
+		when visit_status = 'Missed Visit' then 2
+		when visit_status = 'Completed Visit' and diary_responses.response_completion_date is not null then 3 
+		when visit_status = 'Completed Visit' and diary_responses.response_completion_date is null then 2 
+		end
+		as visit_count_derived,
+		
+		ROW_NUMBER() over (partition by studies.guid, visit_response_status.subject_guid) as count_rank,
+		sum (case 
+			when  visit_status = 'Completed Visit' and diary_responses.response_completion_date is null then 1
+			when  visit_response_status.response_completion_date is null and visit_status = 'Missed Visit'  then 1 else 0 end) over (partition by studies.guid, visit_response_status.subject_guid) as missed_diary_count,
+		sum (case 
+			when  visit_status = 'Completed Visit' and diary_responses.response_completion_date is not null then 1 else 0 end) over (partition by studies.guid, visit_response_status.subject_guid) as completed_diary_count,
+		sum (case 
+			when  visit_status = 'Completed Visit' and diary_responses.response_completion_date is not null then 1
+			when  visit_status = 'Completed Visit' and diary_responses.response_completion_date is null then 1
+			when  visit_response_status.response_completion_date is null and visit_status = 'Missed Visit'  then 1 
+			else 0 end) over (partition by studies.guid, visit_response_status.subject_guid) as total_diary_count,		
+		case when subjects.disabled is true then 'Inactive' else 'Active' end as subject_status,
+		sites.country_code,
+		sites.country_name,
+		--server_user_guid,
+		max(usin.name) over (partition by visit_response_status.subject_guid) as username, 
+		concat(ident, visit_number) as orderbycolumn,
+		now() as refresh_time
+	from visit_response_status
+	join schedule_visit_diary_info on visit_response_status.subject_guid=schedule_visit_diary_info.subject_guid
+		and visit_response_status.planned_diaries=schedule_visit_diary_info.diary_name
+		and visit_response_status.planned_visit_key=schedule_visit_diary_info.visit_key
+	left join diary_responses on visit_response_status.subject_guid = diary_responses.subject_guid
+		and visit_response_status.response_completion_date = diary_responses.response_completion_date
+		and diary_responses.diary_name = planned_diaries
+	left join subjects on visit_response_status.subject_guid = subjects.guid and subjects.disabled is FALSE
+	left join studies on subjects.study_guid = studies.guid
+	left join sites on subjects.site_guid = sites.guid
+	left join orgs on studies.org_guid = orgs.guid
+	left join  user_info usin on visit_response_status.server_user_guid = usin.guid]]></console>
+    </connection>
+  </component>
+  <component name="DBNavigator.Project.DatabaseEditorStateManager">
+    <last-used-providers />
+  </component>
+  <component name="DBNavigator.Project.DatabaseFileManager">
+    <open-files>
+      <object connection-id="1a7a4e3c-6c8c-41f6-b609-682767f96d73" object-ref="consoles/luna - c5241007 missed visit report" />
+    </open-files>
+  </component>
+  <component name="DBNavigator.Project.DatasetFilterManager">
+    <filter-actions connection-id="1a7a4e3c-6c8c-41f6-b609-682767f96d73" dataset="public.sites" active-filter-id="" />
+  </component>
+  <component name="DBNavigator.Project.ExecutionManager">
+    <retain-sticky-names value="false" />
+  </component>
+  <component name="DBNavigator.Project.ObjectQuickFilterManager">
+    <last-used-operator value="EQUAL" />
+    <filters />
+  </component>
+  <component name="DBNavigator.Project.ScriptExecutionManager" clear-outputs="true">
+    <recently-used-interfaces>
+      <mapping database-type="POSTGRES" interface-id="DEFAULT" />
+    </recently-used-interfaces>
+  </component>
+  <component name="DBNavigator.Project.Settings">
+    <connections>
+      <connection id="1a7a4e3c-6c8c-41f6-b609-682767f96d73" active="true" signed="true">
+        <database>
+          <name value="Luna Altavoz" />
+          <description value="" />
+          <database-type value="POSTGRES" />
+          <config-type value="BASIC" />
+          <database-version value="11.19" />
+          <driver-source value="BUNDLED" />
+          <driver-library value="" />
+          <driver value="" />
+          <url-type value="DATABASE" />
+          <host value="856fc5b29241fd0e-database-proxy.luna.altavozclinical.com" />
+          <port value="443" />
+          <database value="altavoz" />
+          <tns-folder value="" />
+          <tns-profile value="" />
+          <type value="USER_PASSWORD" />
+          <user value="ecoa_q36762" />
+          <deprecated-pwd value="YjVlNTdiODU1NzFiOTQzNWRkZmE3Zjk4MDI1YTk3NjZmNDIyNmY0YmQwNjRiYmNkMzJmOWVhYTU1Njk2NWUxZg==" />
+        </database>
+        <properties>
+          <auto-commit value="false" />
+        </properties>
+        <ssh-settings>
+          <active value="false" />
+          <proxy-host value="" />
+          <proxy-port value="22" />
+          <proxy-user value="" />
+          <deprecated-proxy-pwd value="" />
+          <auth-type value="PASSWORD" />
+          <key-file value="" />
+          <key-passphrase value="" />
+        </ssh-settings>
+        <ssl-settings>
+          <active value="false" />
+          <certificate-authority-file value="" />
+          <client-certificate-file value="" />
+          <client-key-file value="" />
+        </ssl-settings>
+        <details>
+          <charset value="UTF-8" />
+          <session-management value="true" />
+          <ddl-file-binding value="true" />
+          <database-logging value="true" />
+          <connect-automatically value="true" />
+          <restore-workspace value="true" />
+          <restore-workspace-deep value="false" />
+          <environment-type value="default" />
+          <connectivity-timeout value="30" />
+          <idle-time-to-disconnect value="30" />
+          <idle-time-to-disconnect-pool value="5" />
+          <credential-expiry-time value="10" />
+          <max-connection-pool-size value="7" />
+          <alternative-statement-delimiter value="" />
+        </details>
+        <debugger>
+          <compile-dependencies value="true" />
+          <tcp-driver-tunneling value="false" />
+          <tcp-host-address value="" />
+          <tcp-port-from value="4000" />
+          <tcp-port-to value="4999" />
+        </debugger>
+        <object-filters hide-empty-schemas="false" hide-pseudo-columns="false" hide-audit-columns="false">
+          <object-type-filter>
+            <object-type name="SCHEMA" enabled="true" />
+            <object-type name="USER" enabled="true" />
+            <object-type name="ROLE" enabled="true" />
+            <object-type name="PRIVILEGE" enabled="true" />
+            <object-type name="CHARSET" enabled="true" />
+            <object-type name="TABLE" enabled="true" />
+            <object-type name="VIEW" enabled="true" />
+            <object-type name="MATERIALIZED_VIEW" enabled="true" />
+            <object-type name="NESTED_TABLE" enabled="true" />
+            <object-type name="COLUMN" enabled="true" />
+            <object-type name="INDEX" enabled="true" />
+            <object-type name="CONSTRAINT" enabled="true" />
+            <object-type name="DATASET_TRIGGER" enabled="true" />
+            <object-type name="DATABASE_TRIGGER" enabled="true" />
+            <object-type name="SYNONYM" enabled="true" />
+            <object-type name="SEQUENCE" enabled="true" />
+            <object-type name="PROCEDURE" enabled="true" />
+            <object-type name="FUNCTION" enabled="true" />
+            <object-type name="PACKAGE" enabled="true" />
+            <object-type name="TYPE" enabled="true" />
+            <object-type name="TYPE_ATTRIBUTE" enabled="true" />
+            <object-type name="ARGUMENT" enabled="true" />
+            <object-type name="DIMENSION" enabled="true" />
+            <object-type name="CLUSTER" enabled="true" />
+            <object-type name="DBLINK" enabled="true" />
+          </object-type-filter>
+          <object-name-filters />
+        </object-filters>
+      </connection>
+    </connections>
+    <browser-settings>
+      <general>
+        <display-mode value="TABBED" />
+        <navigation-history-size value="100" />
+        <show-object-details value="false" />
+      </general>
+      <filters>
+        <object-type-filter>
+          <object-type name="SCHEMA" enabled="true" />
+          <object-type name="USER" enabled="true" />
+          <object-type name="ROLE" enabled="true" />
+          <object-type name="PRIVILEGE" enabled="true" />
+          <object-type name="CHARSET" enabled="true" />
+          <object-type name="TABLE" enabled="true" />
+          <object-type name="VIEW" enabled="true" />
+          <object-type name="MATERIALIZED_VIEW" enabled="true" />
+          <object-type name="NESTED_TABLE" enabled="true" />
+          <object-type name="COLUMN" enabled="true" />
+          <object-type name="INDEX" enabled="true" />
+          <object-type name="CONSTRAINT" enabled="true" />
+          <object-type name="DATASET_TRIGGER" enabled="true" />
+          <object-type name="DATABASE_TRIGGER" enabled="true" />
+          <object-type name="SYNONYM" enabled="true" />
+          <object-type name="SEQUENCE" enabled="true" />
+          <object-type name="PROCEDURE" enabled="true" />
+          <object-type name="FUNCTION" enabled="true" />
+          <object-type name="PACKAGE" enabled="true" />
+          <object-type name="TYPE" enabled="true" />
+          <object-type name="TYPE_ATTRIBUTE" enabled="true" />
+          <object-type name="ARGUMENT" enabled="true" />
+          <object-type name="DIMENSION" enabled="true" />
+          <object-type name="CLUSTER" enabled="true" />
+          <object-type name="DBLINK" enabled="true" />
+        </object-type-filter>
+      </filters>
+      <sorting>
+        <object-type name="COLUMN" sorting-type="NAME" />
+        <object-type name="FUNCTION" sorting-type="NAME" />
+        <object-type name="PROCEDURE" sorting-type="NAME" />
+        <object-type name="ARGUMENT" sorting-type="POSITION" />
+        <object-type name="TYPE ATTRIBUTE" sorting-type="POSITION" />
+      </sorting>
+      <default-editors>
+        <object-type name="VIEW" editor-type="SELECTION" />
+        <object-type name="PACKAGE" editor-type="SELECTION" />
+        <object-type name="TYPE" editor-type="SELECTION" />
+      </default-editors>
+    </browser-settings>
+    <navigation-settings>
+      <lookup-filters>
+        <lookup-objects>
+          <object-type name="SCHEMA" enabled="true" />
+          <object-type name="USER" enabled="false" />
+          <object-type name="ROLE" enabled="false" />
+          <object-type name="PRIVILEGE" enabled="false" />
+          <object-type name="CHARSET" enabled="false" />
+          <object-type name="TABLE" enabled="true" />
+          <object-type name="VIEW" enabled="true" />
+          <object-type name="MATERIALIZED VIEW" enabled="true" />
+          <object-type name="INDEX" enabled="true" />
+          <object-type name="CONSTRAINT" enabled="true" />
+          <object-type name="DATASET TRIGGER" enabled="true" />
+          <object-type name="DATABASE TRIGGER" enabled="true" />
+          <object-type name="SYNONYM" enabled="false" />
+          <object-type name="SEQUENCE" enabled="true" />
+          <object-type name="PROCEDURE" enabled="true" />
+          <object-type name="FUNCTION" enabled="true" />
+          <object-type name="PACKAGE" enabled="true" />
+          <object-type name="TYPE" enabled="true" />
+          <object-type name="DIMENSION" enabled="false" />
+          <object-type name="CLUSTER" enabled="false" />
+          <object-type name="DBLINK" enabled="true" />
+        </lookup-objects>
+        <force-database-load value="false" />
+        <prompt-connection-selection value="true" />
+        <prompt-schema-selection value="true" />
+      </lookup-filters>
+    </navigation-settings>
+    <dataset-grid-settings>
+      <general>
+        <enable-zooming value="true" />
+        <enable-column-tooltip value="true" />
+      </general>
+      <sorting>
+        <nulls-first value="true" />
+        <max-sorting-columns value="4" />
+      </sorting>
+      <audit-columns>
+        <column-names value="" />
+        <visible value="true" />
+        <editable value="false" />
+      </audit-columns>
+    </dataset-grid-settings>
+    <dataset-editor-settings>
+      <text-editor-popup>
+        <active value="false" />
+        <active-if-empty value="false" />
+        <data-length-threshold value="100" />
+        <popup-delay value="1000" />
+      </text-editor-popup>
+      <values-actions-popup>
+        <show-popup-button value="true" />
+        <element-count-threshold value="1000" />
+        <data-length-threshold value="250" />
+      </values-actions-popup>
+      <general>
+        <fetch-block-size value="100" />
+        <fetch-timeout value="30" />
+        <trim-whitespaces value="true" />
+        <convert-empty-strings-to-null value="true" />
+        <select-content-on-cell-edit value="true" />
+        <large-value-preview-active value="true" />
+      </general>
+      <filters>
+        <prompt-filter-dialog value="true" />
+        <default-filter-type value="BASIC" />
+      </filters>
+      <qualified-text-editor text-length-threshold="300">
+        <content-types>
+          <content-type name="Text" enabled="true" />
+          <content-type name="Properties" enabled="true" />
+          <content-type name="XML" enabled="true" />
+          <content-type name="DTD" enabled="true" />
+          <content-type name="HTML" enabled="true" />
+          <content-type name="XHTML" enabled="true" />
+          <content-type name="SQL" enabled="true" />
+          <content-type name="PL/SQL" enabled="true" />
+          <content-type name="JSON" enabled="true" />
+          <content-type name="JSON5" enabled="true" />
+          <content-type name="YAML" enabled="true" />
+        </content-types>
+      </qualified-text-editor>
+      <record-navigation>
+        <navigation-target value="VIEWER" />
+      </record-navigation>
+    </dataset-editor-settings>
+    <code-editor-settings>
+      <general>
+        <show-object-navigation-gutter value="false" />
+        <show-spec-declaration-navigation-gutter value="true" />
+        <enable-spellchecking value="true" />
+        <enable-reference-spellchecking value="false" />
+      </general>
+      <confirmations>
+        <save-changes value="false" />
+        <revert-changes value="true" />
+        <exit-on-changes value="ASK" />
+      </confirmations>
+    </code-editor-settings>
+    <code-completion-settings>
+      <filters>
+        <basic-filter>
+          <filter-element type="RESERVED_WORD" id="keyword" selected="true" />
+          <filter-element type="RESERVED_WORD" id="function" selected="true" />
+          <filter-element type="RESERVED_WORD" id="parameter" selected="true" />
+          <filter-element type="RESERVED_WORD" id="datatype" selected="true" />
+          <filter-element type="RESERVED_WORD" id="exception" selected="true" />
+          <filter-element type="OBJECT" id="schema" selected="true" />
+          <filter-element type="OBJECT" id="role" selected="true" />
+          <filter-element type="OBJECT" id="user" selected="true" />
+          <filter-element type="OBJECT" id="privilege" selected="true" />
+          <user-schema>
+            <filter-element type="OBJECT" id="table" selected="true" />
+            <filter-element type="OBJECT" id="view" selected="true" />
+            <filter-element type="OBJECT" id="materialized view" selected="true" />
+            <filter-element type="OBJECT" id="index" selected="true" />
+            <filter-element type="OBJECT" id="constraint" selected="true" />
+            <filter-element type="OBJECT" id="trigger" selected="true" />
+            <filter-element type="OBJECT" id="synonym" selected="false" />
+            <filter-element type="OBJECT" id="sequence" selected="true" />
+            <filter-element type="OBJECT" id="procedure" selected="true" />
+            <filter-element type="OBJECT" id="function" selected="true" />
+            <filter-element type="OBJECT" id="package" selected="true" />
+            <filter-element type="OBJECT" id="type" selected="true" />
+            <filter-element type="OBJECT" id="dimension" selected="true" />
+            <filter-element type="OBJECT" id="cluster" selected="true" />
+            <filter-element type="OBJECT" id="dblink" selected="true" />
+          </user-schema>
+          <public-schema>
+            <filter-element type="OBJECT" id="table" selected="false" />
+            <filter-element type="OBJECT" id="view" selected="false" />
+            <filter-element type="OBJECT" id="materialized view" selected="false" />
+            <filter-element type="OBJECT" id="index" selected="false" />
+            <filter-element type="OBJECT" id="constraint" selected="false" />
+            <filter-element type="OBJECT" id="trigger" selected="false" />
+            <filter-element type="OBJECT" id="synonym" selected="false" />
+            <filter-element type="OBJECT" id="sequence" selected="false" />
+            <filter-element type="OBJECT" id="procedure" selected="false" />
+            <filter-element type="OBJECT" id="function" selected="false" />
+            <filter-element type="OBJECT" id="package" selected="false" />
+            <filter-element type="OBJECT" id="type" selected="false" />
+            <filter-element type="OBJECT" id="dimension" selected="false" />
+            <filter-element type="OBJECT" id="cluster" selected="false" />
+            <filter-element type="OBJECT" id="dblink" selected="false" />
+          </public-schema>
+          <any-schema>
+            <filter-element type="OBJECT" id="table" selected="true" />
+            <filter-element type="OBJECT" id="view" selected="true" />
+            <filter-element type="OBJECT" id="materialized view" selected="true" />
+            <filter-element type="OBJECT" id="index" selected="true" />
+            <filter-element type="OBJECT" id="constraint" selected="true" />
+            <filter-element type="OBJECT" id="trigger" selected="true" />
+            <filter-element type="OBJECT" id="synonym" selected="true" />
+            <filter-element type="OBJECT" id="sequence" selected="true" />
+            <filter-element type="OBJECT" id="procedure" selected="true" />
+            <filter-element type="OBJECT" id="function" selected="true" />
+            <filter-element type="OBJECT" id="package" selected="true" />
+            <filter-element type="OBJECT" id="type" selected="true" />
+            <filter-element type="OBJECT" id="dimension" selected="true" />
+            <filter-element type="OBJECT" id="cluster" selected="true" />
+            <filter-element type="OBJECT" id="dblink" selected="true" />
+          </any-schema>
+        </basic-filter>
+        <extended-filter>
+          <filter-element type="RESERVED_WORD" id="keyword" selected="true" />
+          <filter-element type="RESERVED_WORD" id="function" selected="true" />
+          <filter-element type="RESERVED_WORD" id="parameter" selected="true" />
+          <filter-element type="RESERVED_WORD" id="datatype" selected="true" />
+          <filter-element type="RESERVED_WORD" id="exception" selected="true" />
+          <filter-element type="OBJECT" id="schema" selected="true" />
+          <filter-element type="OBJECT" id="user" selected="true" />
+          <filter-element type="OBJECT" id="role" selected="true" />
+          <filter-element type="OBJECT" id="privilege" selected="true" />
+          <user-schema>
+            <filter-element type="OBJECT" id="table" selected="true" />
+            <filter-element type="OBJECT" id="view" selected="true" />
+            <filter-element type="OBJECT" id="materialized view" selected="true" />
+            <filter-element type="OBJECT" id="index" selected="true" />
+            <filter-element type="OBJECT" id="constraint" selected="true" />
+            <filter-element type="OBJECT" id="trigger" selected="true" />
+            <filter-element type="OBJECT" id="synonym" selected="true" />
+            <filter-element type="OBJECT" id="sequence" selected="true" />
+            <filter-element type="OBJECT" id="procedure" selected="true" />
+            <filter-element type="OBJECT" id="function" selected="true" />
+            <filter-element type="OBJECT" id="package" selected="true" />
+            <filter-element type="OBJECT" id="type" selected="true" />
+            <filter-element type="OBJECT" id="dimension" selected="true" />
+            <filter-element type="OBJECT" id="cluster" selected="true" />
+            <filter-element type="OBJECT" id="dblink" selected="true" />
+          </user-schema>
+          <public-schema>
+            <filter-element type="OBJECT" id="table" selected="true" />
+            <filter-element type="OBJECT" id="view" selected="true" />
+            <filter-element type="OBJECT" id="materialized view" selected="true" />
+            <filter-element type="OBJECT" id="index" selected="true" />
+            <filter-element type="OBJECT" id="constraint" selected="true" />
+            <filter-element type="OBJECT" id="trigger" selected="true" />
+            <filter-element type="OBJECT" id="synonym" selected="true" />
+            <filter-element type="OBJECT" id="sequence" selected="true" />
+            <filter-element type="OBJECT" id="procedure" selected="true" />
+            <filter-element type="OBJECT" id="function" selected="true" />
+            <filter-element type="OBJECT" id="package" selected="true" />
+            <filter-element type="OBJECT" id="type" selected="true" />
+            <filter-element type="OBJECT" id="dimension" selected="true" />
+            <filter-element type="OBJECT" id="cluster" selected="true" />
+            <filter-element type="OBJECT" id="dblink" selected="true" />
+          </public-schema>
+          <any-schema>
+            <filter-element type="OBJECT" id="table" selected="true" />
+            <filter-element type="OBJECT" id="view" selected="true" />
+            <filter-element type="OBJECT" id="materialized view" selected="true" />
+            <filter-element type="OBJECT" id="index" selected="true" />
+            <filter-element type="OBJECT" id="constraint" selected="true" />
+            <filter-element type="OBJECT" id="trigger" selected="true" />
+            <filter-element type="OBJECT" id="synonym" selected="true" />
+            <filter-element type="OBJECT" id="sequence" selected="true" />
+            <filter-element type="OBJECT" id="procedure" selected="true" />
+            <filter-element type="OBJECT" id="function" selected="true" />
+            <filter-element type="OBJECT" id="package" selected="true" />
+            <filter-element type="OBJECT" id="type" selected="true" />
+            <filter-element type="OBJECT" id="dimension" selected="true" />
+            <filter-element type="OBJECT" id="cluster" selected="true" />
+            <filter-element type="OBJECT" id="dblink" selected="true" />
+          </any-schema>
+        </extended-filter>
+      </filters>
+      <sorting enabled="true">
+        <sorting-element type="RESERVED_WORD" id="keyword" />
+        <sorting-element type="RESERVED_WORD" id="datatype" />
+        <sorting-element type="OBJECT" id="column" />
+        <sorting-element type="OBJECT" id="table" />
+        <sorting-element type="OBJECT" id="view" />
+        <sorting-element type="OBJECT" id="materialized view" />
+        <sorting-element type="OBJECT" id="index" />
+        <sorting-element type="OBJECT" id="constraint" />
+        <sorting-element type="OBJECT" id="trigger" />
+        <sorting-element type="OBJECT" id="synonym" />
+        <sorting-element type="OBJECT" id="sequence" />
+        <sorting-element type="OBJECT" id="procedure" />
+        <sorting-element type="OBJECT" id="function" />
+        <sorting-element type="OBJECT" id="package" />
+        <sorting-element type="OBJECT" id="type" />
+        <sorting-element type="OBJECT" id="dimension" />
+        <sorting-element type="OBJECT" id="cluster" />
+        <sorting-element type="OBJECT" id="dblink" />
+        <sorting-element type="OBJECT" id="schema" />
+        <sorting-element type="OBJECT" id="role" />
+        <sorting-element type="OBJECT" id="user" />
+        <sorting-element type="RESERVED_WORD" id="function" />
+        <sorting-element type="RESERVED_WORD" id="parameter" />
+      </sorting>
+      <format>
+        <enforce-code-style-case value="true" />
+      </format>
+    </code-completion-settings>
+    <execution-engine-settings>
+      <statement-execution>
+        <fetch-block-size value="100" />
+        <execution-timeout value="20" />
+        <debug-execution-timeout value="600" />
+        <focus-result value="false" />
+        <prompt-execution value="false" />
+      </statement-execution>
+      <script-execution>
+        <command-line-interfaces />
+        <execution-timeout value="300" />
+      </script-execution>
+      <method-execution>
+        <execution-timeout value="30" />
+        <debug-execution-timeout value="600" />
+        <parameter-history-size value="10" />
+      </method-execution>
+    </execution-engine-settings>
+    <operation-settings>
+      <transactions>
+        <uncommitted-changes>
+          <on-project-close value="ASK" />
+          <on-disconnect value="ASK" />
+          <on-autocommit-toggle value="ASK" />
+        </uncommitted-changes>
+        <multiple-uncommitted-changes>
+          <on-commit value="ASK" />
+          <on-rollback value="ASK" />
+        </multiple-uncommitted-changes>
+      </transactions>
+      <session-browser>
+        <disconnect-session value="ASK" />
+        <kill-session value="ASK" />
+        <reload-on-filter-change value="false" />
+      </session-browser>
+      <compiler>
+        <compile-type value="KEEP" />
+        <compile-dependencies value="ASK" />
+        <always-show-controls value="false" />
+      </compiler>
+      <debugger>
+        <debugger-type value="JDBC" />
+      </debugger>
+    </operation-settings>
+    <ddl-file-settings>
+      <extensions>
+        <mapping file-type-id="VIEW" extensions="vw" />
+        <mapping file-type-id="TRIGGER" extensions="trg" />
+        <mapping file-type-id="PROCEDURE" extensions="prc" />
+        <mapping file-type-id="FUNCTION" extensions="fnc" />
+        <mapping file-type-id="PACKAGE" extensions="pkg" />
+        <mapping file-type-id="PACKAGE_SPEC" extensions="pks" />
+        <mapping file-type-id="PACKAGE_BODY" extensions="pkb" />
+        <mapping file-type-id="TYPE" extensions="tpe" />
+        <mapping file-type-id="TYPE_SPEC" extensions="tps" />
+        <mapping file-type-id="TYPE_BODY" extensions="tpb" />
+      </extensions>
+      <general>
+        <lookup-ddl-files value="true" />
+        <create-ddl-files value="false" />
+        <synchronize-ddl-files value="true" />
+        <use-qualified-names value="false" />
+        <make-scripts-rerunnable value="true" />
+      </general>
+    </ddl-file-settings>
+    <general-settings>
+      <regional-settings>
+        <date-format value="MEDIUM" />
+        <number-format value="UNGROUPED" />
+        <locale value="SYSTEM_DEFAULT" />
+        <use-custom-formats value="false" />
+      </regional-settings>
+      <environment>
+        <environment-types>
+          <environment-type id="development" name="Development" description="Development environment" color="-2430209/-12296320" readonly-code="false" readonly-data="false" />
+          <environment-type id="integration" name="Integration" description="Integration environment" color="-2621494/-12163514" readonly-code="true" readonly-data="false" />
+          <environment-type id="production" name="Production" description="Productive environment" color="-11574/-10271420" readonly-code="true" readonly-data="true" />
+          <environment-type id="other" name="Other" description="" color="-1576/-10724543" readonly-code="false" readonly-data="false" />
+        </environment-types>
+        <visibility-settings>
+          <connection-tabs value="true" />
+          <dialog-headers value="true" />
+          <object-editor-tabs value="true" />
+          <script-editor-tabs value="false" />
+          <execution-result-tabs value="true" />
+        </visibility-settings>
+      </environment>
+    </general-settings>
+  </component>
+  <component name="DBNavigator.Project.StatementExecutionManager">
+    <execution-variables />
+    <execution-variable-types />
+  </component>
+</project>
